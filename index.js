@@ -23,7 +23,6 @@ const orchestratorPrompt = fs.readFileSync('prompt-orchestrator.txt', 'utf-8');
 const specialistPrompt = fs.readFileSync('prompt.txt', 'utf-8');
 
 // --- HELPER FUNCTIONS ---
-// This is your exact working simplifyHtml function
 function simplifyHtml(html) {
     let simpleHtml = html.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '');
     simpleHtml = simpleHtml.replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, '');
@@ -35,7 +34,6 @@ function simplifyHtml(html) {
     return simpleHtml.replace(/\s{2,}/g, ' ').trim();
 }
 
-// Updated to capture a full page screenshot for the final answer
 async function captureScreenAndDom(page, fullPage = false) {
     const screenshot = await page.screenshot({ encoding: 'base64', fullPage });
     const html = await page.content();
@@ -43,7 +41,7 @@ async function captureScreenAndDom(page, fullPage = false) {
     return { screenshot, simpleHtml };
 }
 
-// --- NEW COMMUNICATION FUNCTIONS ---
+// --- COMMUNICATION FUNCTIONS ---
 const sendMessageToFrontend = (data) => {
     if (clientSocket && clientSocket.readyState === clientSocket.OPEN) {
         clientSocket.send(JSON.stringify(data));
@@ -68,11 +66,9 @@ const requestInputFromFrontend = (message, options) => {
     });
 };
 
-
-// --- AGENT LOGIC FUNCTIONS (adapted from your file for WebSocket communication) ---
-
+// --- AGENT LOGIC FUNCTIONS ---
 async function askOrchestrator(objective, history, summary) {
-    sendMessageToFrontend({ type: 'status', message: '🧠 Orchestrator is planning the next step...' });
+    console.log('🧠 Orchestrator is planning...'); // MOVED TO TERMINAL
     const historyString = history.length > 0 ? history.map((h, i) => `Step ${i + 1}: ${h.reasoning}`).join('\n') : "No actions taken yet.";
     let filledPrompt = orchestratorPrompt.replace('{objective}', objective);
     filledPrompt = filledPrompt.replace('{summary}', summary);
@@ -88,7 +84,7 @@ async function askOrchestrator(objective, history, summary) {
 
 async function askSpecialist(screenshot, simpleHtml, task, isCorrection) {
     const htmlProvided = !!simpleHtml;
-    sendMessageToFrontend({ type: 'status', message: `👁️ Specialist is analyzing... (HTML: ${htmlProvided}, Correction: ${isCorrection})` });
+    console.log(`👁️ Specialist is analyzing... (HTML: ${htmlProvided}, Correction: ${isCorrection})`); // MOVED TO TERMINAL
     const correctionInstruction = isCorrection ? "Your previous action failed. You MUST analyze the provided HTML carefully to find a more stable and correct selector. Do not repeat your last action.\n\n" : "";
     let filledPrompt = specialistPrompt.replace('{task}', task);
     const prompt = `${correctionInstruction}${filledPrompt}`;
@@ -107,7 +103,7 @@ async function askSpecialist(screenshot, simpleHtml, task, isCorrection) {
 
 async function executeAction(page, actionPlan) {
     const { action, selector, text, url, query } = actionPlan;
-    sendMessageToFrontend({ type: 'status', message: `⚡ Executing: ${action.toUpperCase()}` });
+    console.log(`⚡ Executing: ${action.toUpperCase()}`); // MOVED TO TERMINAL
     try {
         switch (action) {
             case 'type':
@@ -121,18 +117,22 @@ async function executeAction(page, actionPlan) {
             case 'Google Search':
                 await page.goto(`https://www.google.com/search?q=${encodeURIComponent(query)}`, { waitUntil: 'networkidle2' });
                 break;
+            case 'scroll': // CORRECTLY IMPLEMENTED SCROLL
+                await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+                break;
             default:
-                sendMessageToFrontend({ type: 'status', message: `🤷 Action '${action}' is a meta-instruction.` });
+                console.log(`🤷 Action '${action}' is a meta-instruction.`);
         }
         return true;
     } catch (e) {
-        const errorMsg = `❌ Error executing action '${action}' on selector '${selector}': ${e.message}`;
-        sendMessageToFrontend({ type: 'status', message: errorMsg });
+        const errorMsg = `❌ Action Failed: ${e.message.split('\n')[0]}`;
+        console.error(errorMsg); // Log detailed error to terminal
+        sendMessageToFrontend({ type: 'status', message: "An action failed, trying to self-correct..." }); // User-friendly message
         return false;
     }
 }
 
-// This is your exact working runAgentSession logic, adapted for WebSockets
+// THIS IS YOUR EXACT WORKING `runAgentSession` LOGIC, MODIFIED FOR CLEANER UI
 async function runAgentSession(objective, page) {
     const context = { credentials: {} };
     const actionHistory = [];
@@ -141,24 +141,13 @@ async function runAgentSession(objective, page) {
     const maxLoops = 20;
     let lastActionFailed = false;
 
+    sendMessageToFrontend({ type: 'status', message: "Okay, starting objective..." });
+
     while (loopCount < maxLoops) {
         loopCount++;
+        console.log(`\n--- Loop ${loopCount} ---`);
         const highLevelPlan = await askOrchestrator(objective, actionHistory, currentStateSummary);
-        
-        // Add this entire "if" block
-        if (highLevelPlan.tool === 'request_credentials') {
-            for (const cred of highLevelPlan.credentials_needed) {
-                const value = await requestInputFromFrontend(`Please provide the ${cred}:`);
-                context.credentials[cred] = value;
-            }
-            // We update the objective to give the AI context that it now has the credentials
-            objective += ` (use the provided credentials: ${Object.keys(context.credentials).join(', ')})`;
-            currentStateSummary = "Credentials have been received from user and added to context.";
-            actionHistory.push(highLevelPlan);
-            continue; // Restart the loop with the new context
-        }
-
-        sendMessageToFrontend({type: 'status', message: `Planning to ${highLevelPlan.tool}...`});
+        console.log('🗺️ Orchestrator Plan:', highLevelPlan);
 
         if (highLevelPlan.tool === 'finished') {
             const { screenshot } = await captureScreenAndDom(page, true);
@@ -166,30 +155,36 @@ async function runAgentSession(objective, page) {
             break;
         }
 
+        if (highLevelPlan.tool === 'request_credentials') {
+            for (const cred of highLevelPlan.credentials_needed) {
+                const value = await requestInputFromFrontend(`Please provide the ${cred}:`);
+                context.credentials[cred] = value;
+            }
+            objective += ` (use the provided credentials: ${Object.keys(context.credentials).join(', ')})`;
+            currentStateSummary = "Credentials received from user.";
+            sendMessageToFrontend({ type: 'status', message: currentStateSummary });
+            actionHistory.push({ reasoning: currentStateSummary, success: true });
+            continue;
+        }
+
         let actionPlan;
         if (highLevelPlan.tool === 'analyze_screen') {
             const { screenshot, simpleHtml } = await captureScreenAndDom(page);
             actionPlan = await askSpecialist(screenshot, lastActionFailed ? simpleHtml : null, highLevelPlan.task, lastActionFailed);
             if (actionPlan.reasoning === 'HTML_NEEDED') {
-                sendMessageToFrontend({ type: 'status', message: 'Specialist needs more context... re-analyzing with HTML.' });
+                console.log('...Specialist needs more context, re-analyzing with HTML.');
                 actionPlan = await askSpecialist(screenshot, simpleHtml, highLevelPlan.task, false);
             }
         } else {
             actionPlan = { ...highLevelPlan, action: highLevelPlan.tool };
         }
         
-        sendMessageToFrontend({ type: 'status', message: `Summary: ${actionPlan.summary || actionPlan.reasoning}` });
+        console.log('💡 Specialist Action:', actionPlan);
 
-        if (actionPlan.action === 'captcha') {
-            const userInput = await requestInputFromFrontend("A CAPTCHA has appeared. Please solve it in the browser, then type 'ok' and press Enter.");
-            currentStateSummary = `Human solved a CAPTCHA. User message: ${userInput}`;
-            continue;
-        }
-
-        if (actionPlan.action === 'request_decision') {
-            const userInput = await requestInputFromFrontend(actionPlan.question, actionPlan.options);
-            currentStateSummary = `Human made a decision. Question: "${actionPlan.question}". User chose: "${userInput}".`;
-            actionHistory.push({ reasoning: currentStateSummary });
+        if (actionPlan.action === 'captcha' || actionPlan.action === 'request_decision') {
+            const userInput = await requestInputFromFrontend(actionPlan.question || "A CAPTCHA has appeared. Please solve it in the browser, then type 'ok'.", actionPlan.options);
+            currentStateSummary = `Human provided input: ${userInput}`;
+            sendMessageToFrontend({ type: 'status', message: "Resuming..." });
             continue;
         }
 
@@ -202,19 +197,17 @@ async function runAgentSession(objective, page) {
         const success = await executeAction(page, actionPlan);
         lastActionFailed = !success;
         
-        if (lastActionFailed) {
-            currentStateSummary = "The last action failed. Attempting to self-correct.";
-        } else {
-            currentStateSummary = actionPlan.summary || "No summary was provided.";
-        }
+        currentStateSummary = actionPlan.summary || "Action completed.";
+        // This is the ONLY summary sent to the frontend during a normal loop
+        sendMessageToFrontend({ type: 'status', message: currentStateSummary });
         
-        actionHistory.push(highLevelPlan);
+        actionHistory.push({ reasoning: highLevelPlan.reasoning, success: success });
         await new Promise(resolve => setTimeout(resolve, 2000));
     }
     if (loopCount >= maxLoops) sendMessageToFrontend({type: 'status', message: '⚠️ Reached max loop limit.'});
 }
 
-// This is the new main function that starts the server
+// --- MAIN SERVER LOGIC (from your working file) ---
 async function main() {
     const app = express();
     app.use(express.static('.'));
@@ -224,16 +217,20 @@ async function main() {
     wss.on('connection', async ws => {
         clientSocket = ws;
         console.log('✅ Frontend connected.');
-        sendMessageToFrontend({ type: 'greeting', message: 'Hello! I am your AI Browser Agent. Please provide your first objective.' });
-        sendMessageToFrontend({ type: 'request_input', message: ''}); // This unlocks the input box
+        
         const browser = await puppeteer.launch({ headless: false, args: ['--start-maximized'], defaultViewport: null, userDataDir: './my_browser_profile' });
         const page = await browser.newPage();
         page.on('dialog', async dialog => dialog.dismiss());
     
+        sendMessageToFrontend({ type: 'greeting', message: 'Hello! I am your AI Browser Agent.' });
+        sendMessageToFrontend({ type: 'request_input', message: 'Please provide your first objective.'});
+
         ws.on('message', async message => {
             try {
                 const data = JSON.parse(message);
                 if (data.type === 'user_input') {
+                    // Reset page to about:blank for a clean slate for the new task
+                    await page.goto('about:blank');
                     await runAgentSession(data.message, page);
                 }
             } catch (e) {
