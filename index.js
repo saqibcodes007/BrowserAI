@@ -157,14 +157,7 @@ async function executeActionNode(state) {
         actionPlan.action = actionPlan.tool;
     }
 
-    // Substitute credential placeholders
-    if (actionPlan.action === 'type') {
-        if (actionPlan.text === '{username}' && state.credentials.username) {
-            actionPlan.text = state.credentials.username;
-        } else if (actionPlan.text === '{password}' && state.credentials.password) {
-            actionPlan.text = state.credentials.password;
-        }
-    }
+    // The placeholder substitution logic has been removed from here.
 
     const success = await executeAction(ws, page, actionPlan);
     const summary = actionPlan.summary || (success ? "Action completed successfully." : "Action failed.");
@@ -232,7 +225,8 @@ puppeteer.use(StealthPlugin());
 const API_KEYS = [
     process.env.GEMINI_API_KEY_1,
     process.env.GEMINI_API_KEY_2,
-    process.env.GEMINI_API_KEY_3
+    process.env.GEMINI_API_KEY_3,
+    process.env.GEMINI_API_KEY_4 // Added the new key
 ].filter(Boolean); // Filter out any undefined keys
 
 const KEY_STATE_PATH = './key_state.json';
@@ -338,6 +332,9 @@ async function executeAction(ws, page, actionPlan) {
     console.log(`⚡ Executing: ${action.toUpperCase()}`); // MOVED TO TERMINAL
     try {
         switch (action) {
+            case 'goto':
+                await page.goto(url, { waitUntil: 'networkidle2' });
+                break;
             case 'type':
                 await page.waitForSelector(selector, { visible: true, timeout: 5000 });
                 await page.type(selector, text, { delay: 50 });
@@ -385,8 +382,9 @@ const workflow = new StateGraph({
         actionPlan: { value: (x, y) => y, default: () => null },
         page: { value: (x, y) => y, default: () => null },
         ws: { value: (x, y) => y, default: () => null },
-        genAI: { value: (x, y) => y, default: () => null }, // ADD THIS LINE
-        needsKeyRotation: { value: (x, y) => y, default: () => false } // ADD THIS LINE
+        genAI: { value: (x, y) => y, default: () => null },
+        needsKeyRotation: { value: (x, y) => y, default: () => false },
+        lastFailingNode: { value: (x, y) => y, default: () => null } // This line is the critical addition
     }
 });
 
