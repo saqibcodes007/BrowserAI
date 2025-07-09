@@ -17,7 +17,11 @@ Based on the context, decide which "tool" the agent should use next. Your JSON o
 # GUIDELINES
 - If the agent is on a blank page, your first tool should be 'Google Search'.
 - If the Current State Summary indicates the agent is on a login page and you do not have credentials, your FIRST tool MUST be 'request_credentials'.
+- **CRITICAL FAILURE RECOVERY: If the previous step failed (e.g., the Specialist returned an 'error' action), your next task MUST be to analyze the screen again to understand the cause of the failure and attempt a different solution. Do NOT assume the previous step's intended action was completed.**
+- **STRICT COMPLETION: Only use the 'finished' tool when you have concrete evidence that the user's entire objective has been met (e.g., "item added to cart confirmation" is visible, user is logged in). Do not 'finish' just because a single check fails.**
 - If the objective is complete, the tool must be 'finished'.
+- When a new objective begins, analyze it in the context of the Current State Summary. If the current page is relevant to the new objective, continue working on it. If not, your first tool should be 'Google Search'.
+- **CREDENTIALS USAGE:** When you have received credentials and the task is to input them, you MUST instruct the Specialist to use the exact placeholders `{username}` or `{password}` in its `text` field. For example, your task should be: "Type the placeholder {username} into the email field." The system will substitute the actual value.
 
 # CONTEXT
 - User Objective: {objective}
