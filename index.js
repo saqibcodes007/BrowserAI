@@ -7,6 +7,217 @@ const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 
+// --- NEW: LANGGRAPH SETUP ---
+const { START, StateGraph } = require("@langchain/langgraph");
+
+/**
+ * Represents the state of our agent. This is the central "memory" that
+ * will be passed between all the nodes in our graph.
+ *
+ * @property {string} objective - The initial user request.
+ * @property {object} credentials - Any credentials collected from the user.
+ * @property {any[]} history - The history of actions taken by the agent.
+ * @property {string} summary - The summary of the current page state.
+ * @property {boolean} lastActionFailed - Flag to indicate if the last tool call failed.
+ * @property {object} nextPage - The next node to execute in the graph.
+ */
+// NOTE: In a real TypeScript project, this would be an interface.
+// We define it as a comment here for clarity in our JavaScript file.
+/*
+interface AgentState {
+    objective: string;
+    credentials: { [key: string]: string };
+    history: any[];
+    summary: string;
+    lastActionFailed: boolean;
+    nextPage: any;
+    needsKeyRotation: boolean; // ADD THIS FOR CLARITY
+}
+*/
+
+// --- NEW: DEFINE GRAPH NODES ---
+
+/**
+ * Calls the Orchestrator model to decide the next high-level tool to use.
+ * This node takes the current agent state and returns an updated state with the
+ * orchestrator's plan.
+ */
+async function callOrchestrator(state) {
+    const { genAI } = state; // Receive the AI instance from the state
+    const orchestratorModel = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+    console.log('🧠 Orchestrator is planning...');
+    const { objective, history, summary, credentials } = state;
+    const historyString = history.length > 0 ? history.map((h, i) => `Step ${i + 1}: ${JSON.stringify(h)}`).join('\n') : "No actions taken yet.";
+    const credentialsString = Object.keys(credentials).length > 0 ? `The following credentials have been provided: [${Object.keys(credentials).join(', ')}]` : "No credentials have been provided.";
+
+    let filledPrompt = orchestratorPrompt
+        .replace('{objective}', objective)
+        .replace('{summary}', summary)
+        .replace('{history}', historyString)
+        .replace('{credentials}', credentialsString);
+
+    let rawResult = '';
+    try {
+        const result = await orchestratorModel.generateContent(filledPrompt);
+        rawResult = result.response.text();
+        const cleanedJson = rawResult.replace(/```json|```/g, '').trim();
+        const plan = JSON.parse(cleanedJson);
+        console.log('🗺️ Orchestrator Plan:', plan);
+        // This is a crucial change: we now put the orchestrator's plan into the 'actionPlan' field
+        // if it's a direct action, bypassing the specialist.
+        return { ...state, highLevelPlan: plan, actionPlan: plan };
+    } 
+    
+    catch (e) {
+        console.error("Orchestrator failed:", e.message);
+        if (e.message && e.message.includes('429')) {
+            console.log("🛑 Rate limit hit on Orchestrator. Triggering key rotation.");
+            sendMessageToFrontend(state.ws, { type: 'status', message: 'Rate limit reached. Rotating API key...' });
+            // --- MODIFIED: Explicitly state which node failed ---
+            return { ...state, needsKeyRotation: true, lastFailingNode: "orchestrator" };
+        }
+        console.error("--- RAW ORCHESTRATOR OUTPUT ---");
+        console.error(rawResult);
+        console.error("-------------------------------");
+        return { ...state, lastActionFailed: true, summary: `Orchestrator failed: ${e.message}` };
+    }
+}
+/**
+ * Calls the Specialist model to get a specific browser action based on the
+ * orchestrator's task and a screenshot.
+ */
+async function callSpecialist(state) {
+    const { genAI } = state;
+    console.log('👁️ Specialist is analyzing...');
+    const { highLevelPlan, lastActionFailed, page } = state;
+    const { task } = highLevelPlan;
+
+    try {
+        const { screenshot, simpleHtml } = await captureScreenAndDom(page);
+        const htmlNeeded = lastActionFailed || (highLevelPlan.tool === 'analyze_screen' && task.includes('HTML'));
+        
+        const specialistResult = await askSpecialist(genAI, screenshot, htmlNeeded ? simpleHtml : null, task, lastActionFailed);
+        console.log('💡 Specialist Action:', specialistResult);
+
+        // If the specialist needs HTML but didn't get it, retry with HTML
+        if (specialistResult.reasoning === 'HTML_NEEDED' && !htmlNeeded) {
+            console.log('...Specialist needs HTML, re-analyzing with it.');
+            const retryResult = await askSpecialist(genAI, screenshot, simpleHtml, task, false);
+            return { ...state, actionPlan: retryResult, lastActionFailed: false };
+        }
+
+        return { ...state, actionPlan: specialistResult, lastActionFailed: false };
+    } catch (e) {
+        console.error("Specialist failed:", e.message);
+        if (e.message && e.message.includes('429')) {
+            console.log("🛑 Rate limit hit on Specialist. Triggering key rotation.");
+            sendMessageToFrontend(state.ws, { type: 'status', message: 'Rate limit reached. Rotating API key...' });
+            // --- MODIFIED: Explicitly state which node failed ---
+            return { ...state, needsKeyRotation: true, lastFailingNode: "specialist" };
+        }
+        return { ...state, lastActionFailed: true, summary: `Specialist failed: ${e.message}` };
+    }
+}
+
+/**
+ * This node is used to parse and store context (like URLs and credentials)
+ * found in the initial user objective.
+ */
+async function updateContextNode(state) {
+    const { actionPlan } = state;
+    console.log('📝 Updating context with initial information...', actionPlan);
+
+    const newCredentials = actionPlan.credentials || {};
+    const summary = actionPlan.url 
+        ? `Context updated. Navigating to initial URL: ${actionPlan.url}`
+        : `Context updated with provided credentials: ${Object.keys(newCredentials).join(', ')}`;
+
+    // If a URL was found, we will execute a 'goto' action immediately after this.
+    // We set the next action directly in the state.
+    const nextAction = actionPlan.url ? { action: 'goto', url: actionPlan.url } : null;
+
+    return {
+        ...state,
+        credentials: { ...state.credentials, ...newCredentials },
+        summary: summary,
+        // If a URL was parsed, tee up the 'goto' action for the executor
+        actionPlan: nextAction || state.actionPlan, 
+        history: [...state.history, { context_update: actionPlan }]
+    };
+}
+
+/**
+ * Executes the specific browser action planned by the Specialist.
+ * This is where the agent interacts with the Puppeteer page.
+ */
+async function executeActionNode(state) {
+    const { actionPlan, page, ws } = state;
+
+    if (!actionPlan.action) {
+        actionPlan.action = actionPlan.tool;
+    }
+
+    // Substitute credential placeholders
+    if (actionPlan.action === 'type') {
+        if (actionPlan.text === '{username}' && state.credentials.username) {
+            actionPlan.text = state.credentials.username;
+        } else if (actionPlan.text === '{password}' && state.credentials.password) {
+            actionPlan.text = state.credentials.password;
+        }
+    }
+
+    const success = await executeAction(ws, page, actionPlan);
+    const summary = actionPlan.summary || (success ? "Action completed successfully." : "Action failed.");
+    sendMessageToFrontend(ws, { type: 'status', message: summary });
+
+    return { ...state, summary, lastActionFailed: !success, history: [...state.history, { specialist: actionPlan, success }] };
+}
+
+/**
+ * A helper node to pause the graph and request input from the human user.
+ * This is used for credentials, CAPTCHAs, and decisions.
+ */
+/**
+ * A generalized node to pause the graph and request any necessary input
+ * from the human user, based on a question formulated by the Orchestrator.
+ */
+async function humanInputNode(state) {
+    const { highLevelPlan, ws } = state;
+    const question = highLevelPlan.question; // The AI formulates the question
+
+    // Request the input from the frontend
+    const userInput = await requestInputFromFrontend(ws, question);
+    sendMessageToFrontend(ws, { type: 'status', message: `Received user input.` });
+
+    // We update the summary to reflect the human's contribution,
+    // which gives the Orchestrator context for its next plan.
+    return {
+        ...state,
+        summary: `Human provided the following input: ${userInput}`,
+        history: [...state.history, { human_input: userInput }]
+    };
+}
+
+/**
+ * This node rotates to the next available API key and initializes a new
+ * GoogleGenerativeAI client. It's triggered when a 429 error is detected.
+ */
+async function rotateKeyNode(state) {
+    const keyIndex = getNextKeyIndex();
+    const currentKey = API_KEYS[keyIndex];
+    console.log(`🔑 Rotating to new API Key #${keyIndex + 1}`);
+    const newGenAI = new GoogleGenerativeAI(currentKey);
+
+    // Reset the flag and update the AI client in the state
+    return {
+        ...state,
+        genAI: newGenAI,
+        needsKeyRotation: false,
+        // Crucially, we tell the graph which node failed so we can return to it
+        // lastFailingNode: state.nextPage.name
+    };
+}
+
 // --- SERVER SETUP ---
 const app = express();
 app.use(express.static('.')); // Serve files from the current directory
@@ -16,9 +227,29 @@ const wss = new WebSocketServer({ server });
 
 // --- PUPPETEER & AI SETUP (from your working file) ---
 puppeteer.use(StealthPlugin());
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const orchestratorModel = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
-const specialistModel = genAI.getGenerativeModel({ model: "gemini-2.5-pro" });
+
+// --- NEW: API KEY ROTATION SETUP ---
+const API_KEYS = [
+    process.env.GEMINI_API_KEY_1,
+    process.env.GEMINI_API_KEY_2,
+    process.env.GEMINI_API_KEY_3
+].filter(Boolean); // Filter out any undefined keys
+
+const KEY_STATE_PATH = './key_state.json';
+
+function getNextKeyIndex() {
+    try {
+        const state = JSON.parse(fs.readFileSync(KEY_STATE_PATH, 'utf-8'));
+        const nextIndex = (state.lastKeyIndex + 1) % API_KEYS.length;
+        fs.writeFileSync(KEY_STATE_PATH, JSON.stringify({ lastKeyIndex: nextIndex }));
+        return nextIndex;
+    } catch (e) {
+        console.error("Could not read key state, starting from index 0.", e);
+        fs.writeFileSync(KEY_STATE_PATH, JSON.stringify({ lastKeyIndex: 0 }));
+        return 0;
+    }
+}
+
 const orchestratorPrompt = fs.readFileSync('prompt-orchestrator.txt', 'utf-8');
 const specialistPrompt = fs.readFileSync('prompt.txt', 'utf-8');
 
@@ -82,7 +313,8 @@ async function askOrchestrator(objective, history, summary) {
     }
 }
 
-async function askSpecialist(screenshot, simpleHtml, task, isCorrection) {
+async function askSpecialist(genAI, screenshot, simpleHtml, task, isCorrection) {
+    const specialistModel = genAI.getGenerativeModel({ model: "gemini-2.5-pro" });
     const htmlProvided = !!simpleHtml;
     console.log(`👁️ Specialist is analyzing... (HTML: ${htmlProvided}, Correction: ${isCorrection})`); // MOVED TO TERMINAL
     const correctionInstruction = isCorrection ? "Your previous action failed. You MUST analyze the provided HTML carefully to find a more stable and correct selector. Do not repeat your last action.\n\n" : "";
@@ -137,147 +369,182 @@ async function executeAction(ws, page, actionPlan) {
     }
 }
 
-// THIS IS YOUR EXACT WORKING `runAgentSession` LOGIC, MODIFIED FOR CLEANER UI
-async function runAgentSession(ws, objective, browser, page) { // Add browser here
-    const context = { credentials: {} };
-    const actionHistory = [];
-    let currentStateSummary = "Just started. The browser is on a blank page.";
-    let loopCount = 0;
-    const maxLoops = 20;
-    let lastActionFailed = false;
 
-    sendMessageToFrontend(ws, { type: 'status', message: "Okay, starting objective..." });
-
-    while (loopCount < maxLoops) {
-        loopCount++;
-        
-        if (page.isClosed()) {
-            console.log('Page was closed, creating a new one.');
-            page = await browser.newPage();
-            await page.goto('about:blank'); // Start with a clean slate
-            currentStateSummary = "Recovered from a page closure. The browser is on a blank page.";
-        }
-
-        console.log(`\n--- Loop ${loopCount} ---`);
-        const highLevelPlan = await askOrchestrator(objective, actionHistory, currentStateSummary);
-        console.log('🗺️ Orchestrator Plan:', highLevelPlan);
-
-        if (highLevelPlan.tool === 'finished') {
-            const { screenshot } = await captureScreenAndDom(page, true);
-            sendMessageToFrontend(ws, { type: 'final_answer', message: highLevelPlan.answer || "Task completed." }); // Add this line
-            break;
-        }
-
-        if (highLevelPlan.tool === 'request_credentials') {
-            for (const cred of highLevelPlan.credentials_needed) {
-                const value = await requestInputFromFrontend(ws, `Please provide the ${cred}:`);
-                context.credentials[cred] = value;
-            }
-            objective += ` (use the provided credentials: ${Object.keys(context.credentials).join(', ')})`;
-            currentStateSummary = "Credentials received from user.";
-            sendMessageToFrontend(ws, { type: 'status', message: currentStateSummary });
-            actionHistory.push({ reasoning: currentStateSummary, success: true });
-            continue;
-        }
-
-        let actionPlan;
-        if (highLevelPlan.tool === 'analyze_screen') {
-            const { screenshot, simpleHtml } = await captureScreenAndDom(page);
-            actionPlan = await askSpecialist(screenshot, lastActionFailed ? simpleHtml : null, highLevelPlan.task, lastActionFailed);
-            if (actionPlan.reasoning === 'HTML_NEEDED') {
-                console.log('...Specialist needs more context, re-analyzing with HTML.');
-                actionPlan = await askSpecialist(screenshot, simpleHtml, highLevelPlan.task, false);
-            }
-        } else {
-            actionPlan = { ...highLevelPlan, action: highLevelPlan.tool };
-        }
-        
-        if (actionPlan.action === 'type') {
-            if (actionPlan.text === '{username}' && context.credentials.username) {
-                actionPlan.text = context.credentials.username;
-            } else if (actionPlan.text === '{password}' && context.credentials.password) {
-                actionPlan.text = context.credentials.password;
-            }
-        }
-
-        console.log('💡 Specialist Action:', actionPlan);
-
-        if (actionPlan.action === 'captcha' || actionPlan.action === 'request_decision') {
-            const userInput = await requestInputFromFrontend(ws, actionPlan.question || "A CAPTCHA has appeared. Please solve it in the browser, then type 'ok'.", actionPlan.options);
-            currentStateSummary = `Human provided input: ${userInput}`;
-            sendMessageToFrontend(ws, { type: 'status', message: "Resuming..." });
-            continue;
-        }
-
-        if (actionPlan.action === 'finished') {
-             const { screenshot } = await captureScreenAndDom(page, true);
-             sendMessageToFrontend(ws, { type: 'final_answer', message: actionPlan.answer || "Task completed.", screenshot });
-             break;
-        }
-
-        const success = await executeAction(ws, page, actionPlan);
-        lastActionFailed = !success;
-        
-        currentStateSummary = actionPlan.summary || "Action completed.";
-        // This is the ONLY summary sent to the frontend during a normal loop
-        sendMessageToFrontend(ws, { type: 'status', message: currentStateSummary });
-        
-        actionHistory.push({ reasoning: highLevelPlan.reasoning, success: success });
-        await new Promise(resolve => setTimeout(resolve, 2000));
-    }
-    if (loopCount >= maxLoops) sendMessageToFrontend(ws, { type: 'status', message: '⚠️ Reached max loop limit.' });
-}
 
 // --- MAIN SERVER LOGIC (from your working file) ---
+// --- NEW: BUILD AND COMPILE THE GRAPH ---
+
+const workflow = new StateGraph({
+    channels: {
+        objective: { value: (x, y) => y, default: () => "" },
+        credentials: { value: (x, y) => ({...x, ...y}), default: () => ({}) },
+        history: { value: (x, y) => x.concat(y), default: () => [] },
+        summary: { value: (x, y) => y, default: () => "No summary yet." },
+        lastActionFailed: { value: (x, y) => y, default: () => false },
+        highLevelPlan: { value: (x, y) => y, default: () => null },
+        actionPlan: { value: (x, y) => y, default: () => null },
+        page: { value: (x, y) => y, default: () => null },
+        ws: { value: (x, y) => y, default: () => null },
+        genAI: { value: (x, y) => y, default: () => null }, // ADD THIS LINE
+        needsKeyRotation: { value: (x, y) => y, default: () => false } // ADD THIS LINE
+    }
+});
+
+// Add the nodes to the graph
+workflow.addNode("orchestrator", callOrchestrator);
+workflow.addNode("specialist", callSpecialist);
+workflow.addNode("executor", executeActionNode);
+workflow.addNode("human", humanInputNode);
+workflow.addNode("rotate_key", rotateKeyNode);
+workflow.addNode("update_context", updateContextNode); // Add this line
+
+
+// Define the entry point for the graph
+workflow.addEdge(START, "orchestrator");
+
+// Define the conditional logic for routing between nodes
+workflow.addConditionalEdges("orchestrator", (state) => {
+    if (state.needsKeyRotation) return "rotate_key";
+    const { tool } = state.highLevelPlan;
+    console.log(`Routing based on orchestrator tool: ${tool}`);
+
+    if (tool === 'update_context') return "update_context";
+    if (tool === 'request_human_input') return "human"; // Universal route to human
+    if (tool === 'finished') return "__end__";
+    if (tool === 'analyze_screen') return "specialist";
+    if (tool === 'Google Search' || tool === 'goto') return "executor";
+    return "__end__";
+}, {
+    "specialist": "specialist",
+    "executor": "executor",
+    "human": "human",
+    "rotate_key": "rotate_key",
+    "update_context": "update_context",
+    "__end__": "__end__"
+});
+
+workflow.addConditionalEdges("specialist", (state) => {
+    // Check if the specialist itself failed with a rate-limit error
+    if (state.needsKeyRotation) {
+        return "rotate_key";
+    }
+    if (state.actionPlan.action === 'error') {
+        return "orchestrator"; // On regular failure, re-plan
+    }
+    return "executor";
+}, {
+    "executor": "executor",
+    "orchestrator": "orchestrator",
+    "rotate_key": "rotate_key" // Add the new rotation route
+});
+
+// This is the new logic for handling recovery after a key rotation
+workflow.addConditionalEdges("rotate_key", (state) => {
+    // After rotating a key, we check which node failed and route back to it
+    // so it can retry the action with the new key.
+    const lastFailingNode = state.lastFailingNode;
+    console.log(`↩️ Returning to failed node: ${lastFailingNode}`);
+    if (lastFailingNode === "orchestrator" || lastFailingNode === "specialist") {
+        return lastFailingNode;
+    }
+    return "end"; // Fallback if the failing node is unknown
+}, {
+    "orchestrator": "orchestrator",
+    "specialist": "specialist",
+    "end": "__end__"
+});
+
+// This new edge handles the flow after parsing the initial prompt
+ workflow.addConditionalEdges("update_context", (state) => {
+     // If the update included a URL, the next action is to execute the 'goto' command
+     if (state.actionPlan && state.actionPlan.action === 'goto') {
+         return "executor";
+     }
+     // Otherwise, go back to the orchestrator for the next plan
+     return "orchestrator";
+ }, {
+     "executor": "executor",
+     "orchestrator": "orchestrator"
+ });
+
+// After a successful action or human input, always loop back to the orchestrator
+workflow.addEdge("executor", "orchestrator");
+workflow.addEdge("human", "orchestrator");
+
+// Compile the graph into a runnable agent
+const appGraph = workflow.compile();
+
+
+// --- MAIN SERVER LOGIC (REVISED FOR LANGGRAPH) ---
 async function main() {
     const app = express();
     app.use(express.static('.'));
     const server = http.createServer(app);
     const wss = new WebSocketServer({ server });
 
-    // Initialize the browser ONCE, outside the connection handler
     const browser = await puppeteer.launch({ headless: false, args: ['--start-maximized'], defaultViewport: null, userDataDir: './my_browser_profile' });
 
     wss.on('connection', async ws => {
-        clientSocket = ws;
         console.log('✅ Frontend connected.');
 
-        // Now 'browser' is accessible here.
-        const page = await browser.newPage();
-        page.on('dialog', async dialog => dialog.dismiss());
-
         sendMessageToFrontend(ws, { type: 'greeting', message: 'Hello! I am your AI Browser Agent.' });
-        sendMessageToFrontend(ws, { type: 'request_input', message: 'Please provide your first objective.'});
+        sendMessageToFrontend(ws, { type: 'request_input', message: 'Please provide your objective.'});
 
-        // This handler is ONLY for the very first objective from the user.
         const initialObjectiveHandler = async (message) => {
             try {
                 const data = JSON.parse(message);
                 if (data.type === 'user_input') {
-                    // Once the first objective is received, remove this listener.
-                    // All subsequent 'user_input' messages will be handled by the promise
-                    // inside `requestInputFromFrontend`.
                     ws.removeListener('message', initialObjectiveHandler);
-                    await runAgentSession(ws, data.message, browser, page);
+
+                                // --- NEW: Perform Key Rotation ---
+                    const keyIndex = getNextKeyIndex();
+                    const currentKey = API_KEYS[keyIndex];
+                    console.log(`🔑 Using API Key #${keyIndex + 1}`);
+                    const genAI = new GoogleGenerativeAI(currentKey);
+            // --- End of new block ---
+
+                    const page = await browser.newPage();
+                    page.on('dialog', async dialog => dialog.dismiss());
+
+                    const initialState = {
+                        objective: data.message,
+                        page: page,
+                        ws: ws,
+                        summary: "The browser is on a blank page.",
+                        genAI: genAI // Pass the AI instance to the state
+                    };
+
+                    // This is where the magic happens: we invoke the graph
+                    await appGraph.invoke(initialState);
+
+                    // After the graph finishes, clean up the page
+                    if (page && !page.isClosed()) {
+                        await page.close();
+                    }
+                     sendMessageToFrontend(ws, { type: 'request_input', message: 'Please provide your next objective.'});
+                     ws.on('message', initialObjectiveHandler); // Re-attach listener for the next task
                 }
             } catch (e) {
-                console.error("Error processing initial objective:", e);
+                console.error("Error processing objective:", e);
+                 sendMessageToFrontend(ws, { type: 'status', message: `A critical error occurred: ${e.message}` });
             }
         };
 
         ws.on('message', initialObjectiveHandler);
 
-        ws.on('close', async () => {
+        ws.on('close', () => {
             console.log('❌ Frontend disconnected.');
-            if (page && !page.isClosed()) {
-                await page.close(); // Close the page associated with this session
-            }
         });
+    });
+
+    process.on('SIGINT', async () => {
+        console.log("Shutting down browser...");
+        await browser.close();
+        process.exit(0);
     });
 
     server.listen(3000, () => {
         console.log('🚀 Server is ready and listening on http://localhost:3000');
-        console.log('Please open your Chrome browser and navigate to that address to use the agent.');
     });
 }
 
