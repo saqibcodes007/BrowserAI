@@ -6,3 +6,5 @@ node_modules/
 
 # Puppeteer user data
 my_browser_profile/
+
+key_state.json
