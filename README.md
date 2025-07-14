@@ -1,43 +1,44 @@
-# BrowserAI
+# BrowserAI: The Autonomous Web Agent - Developer's Manual
 
-BrowserAI is an advanced, modular, AI-powered web automation agent that leverages Google Gemini models, Puppeteer, and a LangGraph-based workflow to perform complex browser tasks based on natural language objectives. It features robust error recovery, API key rotation, and a human-in-the-loop design for safe, adaptive automation.
-
----
-
-## Table of Contents
-- [Features](#features)
-- [Architecture Overview](#architecture-overview)
-- [How It Works](#how-it-works)
-- [File-by-File Deep Dive](#file-by-file-deep-dive)
-  - [index.js](#indexjs---core-server--agent-logic)
-  - [prompt-orchestrator.txt](#prompt-orchestratortxt---orchestrator-prompt)
-  - [prompt.txt](#prompttxt---specialist-prompt)
-  - [client.js](#clientjs---frontend-logic)
-  - [index.html](#indexhtml---frontend-ui)
-  - [style.css](#stylecss---styling)
-  - [package.json](#packagejson---dependencies)
-  - [NOTES.md](#notesmd---project-notes)
-- [Setup & Usage](#setup--usage)
-- [API Key Management](#api-key-management)
-- [Security & Best Practices](#security--best-practices)
-- [Troubleshooting](#troubleshooting)
-- [License](#license)
+**Version**: 2.0 (LangGraph, RAG Memory Integration)
+**Author**: Saqib Sherwani
+**Last Updated**: July 11, 2025
 
 ---
 
-## Features
-- **Natural Language Automation**: Users describe objectives in plain English; the agent decomposes and executes them step-by-step.
-- **LangGraph Workflow**: Modular, stateful agent logic using a directed graph of nodes (Orchestrator, Specialist, Executor, Human Input, Key Rotation, Context Update).
-- **Google Gemini AI**: Uses Gemini 2.5 models for both high-level planning and low-level browser actions.
-- **Puppeteer + Stealth**: Automates Chrome with anti-bot detection evasion.
-- **API Key Rotation**: Handles rate limits by rotating through multiple Gemini API keys.
-- **Human-in-the-Loop**: Requests user input for credentials, CAPTCHAs, or ambiguous decisions.
-- **Robust Error Recovery**: Detects and recovers from failed actions, rate limits, and looping failures.
-- **WebSocket Frontend**: Real-time chat interface for objectives, status, and agent interaction.
+## 1. Project Overview
+
+BrowserAI is a sophisticated autonomous agent designed to understand high-level human objectives and translate them into browser actions to achieve goals. It moves beyond simple scripting by leveraging a powerful dual-model AI architecture, a state machine for logical reasoning (LangGraph), and a persistent vector store for long-term memory, enabling it to learn from experience.
+
+This document serves as the complete technical guide for developers working on the BrowserAI project. It covers the system architecture, setup, developer guidelines for debugging and adding features, and a strategic roadmap for future enhancements.
 
 ---
 
-## Architecture Overview
+## 2. Core Features
+
+* **Autonomous Web Navigation**: Understands natural language commands and executes them using a robust, memory-driven, and context-aware architecture.
+* **Dual-Model AI Architecture**:
+    * **Orchestrator (`gemini-2.5-pro`)**: High-level planner that creates strategies based on rich, descriptive summaries and history.
+    * **Specialist (`gemini-2.5-pro`)**: Vision model that now produces multi-step action plans for complex tasks, or single actions for simple ones.
+* **Stateful Reasoning Engine (LangGraph)**: The agent's logic is a robust state graph, supporting conditional branching, error handling, and auditable reasoning.
+* **Long-Term Memory (RAG, ChromaDB)**: Stores successful plans and can recall and execute them for similar objectives, enabling true learning and repeatability.
+* **Intelligent Self-Correction & Resilience**:
+    * Retries API calls on server errors (`503`).
+    * Rotates API keys on rate-limiting (`429`).
+    * Re-analyzes pages with HTML context for improved selector stability.
+    * Classifies and recovers from different error types (planned upgrade).
+* **Advanced Human-in-the-Loop (HITL) Collaboration**: Proactively requests help for credentials, CAPTCHAs, and ambiguous UI choices.
+* **Persistent Browser Session**: Maintains session data for reduced CAPTCHAs and improved continuity.
+* **Rich Action Summaries**: After every action, the agent generates a descriptive summary (including the current URL) for improved planning and context-awareness.
+* **Fully Functional Memory Execution**: The agent can recall and robustly execute multi-step plans from memory, aborting and reporting if any step fails.
+
+---
+
+## 3. System Architecture
+
+The agent operates as a cyclical graph, managed by LangGraph. Each node in the graph represents a distinct state or capability.
+
+### 3.1. Architectural Diagram (Conceptual Flow)
 
 ```
 User <-> Web UI (client.js, index.html) <-> WebSocket <-> Node.js Server (index.js)
@@ -52,135 +53,168 @@ User <-> Web UI (client.js, index.html) <-> WebSocket <-> Node.js Server (index.
                                               Google Gemini API (AI Planning/Action)
 ```
 
-- **Orchestrator**: Plans high-level steps using only the objective, state summary, and action history.
-- **Specialist**: Receives a specific task and analyzes screenshots/HTML to generate precise browser actions.
-- **Executor**: Runs the action in Puppeteer and updates state.
-- **Human Input**: Pauses for user input when needed.
-- **Key Rotation**: Handles API rate limits by switching keys.
-- **Context Update**: Parses credentials/URLs from the objective.
+### 3.2. Core Components & Nodes
+
+* **`index.js` (The Main Application)**:
+    * Initializes the Express server and WebSocket for frontend communication.
+    * Launches the Puppeteer browser instance.
+    * Defines and compiles the LangGraph state machine.
+    * Manages the main application loop.
+
+* **`prompt-orchestrator.txt` (The Planner's Brain)**:
+    * This is the master prompt for the high-level planning AI. It receives the user's objective and a *summary* of recent history and decides which tool to use next (`analyze_screen`, `Google Search`, `request_human_input`, etc.). It does **not** see the screen.
+
+* **`prompt.txt` (The Specialist's Brain)**:
+    * This prompt now instructs the Specialist to return a complete, step-by-step plan (array of actions) for complex tasks, or a single action for simple ones. It receives a high-level task, screenshot, and HTML context.
+
+* **LangGraph Nodes (The Agent's Skills)**:
+    * **`retrieveMemoryNode`**: Searches ChromaDB for similar, successful plans and enables robust memory recall and execution.
+    * **`callOrchestrator`**: High-level planner. Now receives rich, descriptive summaries after every action for improved reasoning.
+    * **`callSpecialist`**: Produces multi-step plans or single actions, depending on the task complexity.
+    * **`executeActionNode`**: Executes a sequence of actions (plan) or a single action, and generates a descriptive summary including the current URL.
+    * **`executeMemoryNode`**: Executes recalled plans from memory, step-by-step, aborting and reporting if any step fails, and provides a final summary.
+    * **`humanInputNode`**: Requests input from the user via the web UI.
+    * **`rotateKeyNode`**: Manages API key rotation on rate limits.
+    * **`saveMemoryNode`**: Saves successful plans to ChromaDB for future recall.
+
+* **ChromaDB (The Long-Term Memory)**:
+    * A separate Docker container running a vector database.
+    * Stores embeddings of successful `(objective, plan)` pairs.
+    * Enables the `retrieveMemoryNode` to perform similarity searches.
 
 ---
 
-## How It Works
-1. **User connects via browser** and submits an objective (e.g., "Log into Gmail and check unread emails").
-2. **Server launches a Chrome instance** (with a persistent profile for session continuity).
-3. **LangGraph agent** orchestrates the workflow:
-   - Orchestrator plans the next tool (analyze screen, Google Search, goto, request input, finish).
-   - Specialist receives a screenshot/HTML and outputs a JSON action (click, type, scroll, error).
-   - Executor runs the action in Puppeteer.
-   - Human Input node requests user input if blocked.
-   - Key Rotation node handles API rate limits.
-   - Context Update node parses credentials/URLs from the objective.
-4. **Frontend updates in real time** with status, screenshots, and input requests.
-5. **Loop continues** until the objective is achieved or the user stops.
+## 4. Setup and Installation Guide
+
+Follow these steps precisely to ensure a clean and correct setup.
+
+### 4.1. Prerequisites
+
+1.  **Node.js**: Ensure you have Node.js version 22.x or higher installed.
+2.  **Docker Desktop**: You **must** have Docker Desktop installed and running on your machine. This is required to run the ChromaDB database. [Download Docker Desktop](https://www.docker.com/products/docker-desktop/).
+
+### 4.2. Initial Project Setup
+
+1.  **Clone/Download**: Place all project files into a single folder.
+2.  **Clean Slate (Crucial for Upgrades)**: If you are upgrading or have had previous installation issues, **delete** the following from your project folder:
+    * The entire `node_modules` folder.
+    * The `package-lock.json` file.
+3.  **Configure Environment Variables**:
+    * Create a file named `.env` in the root of the project folder.
+    * Add your Google Gemini API keys to this file. You must have at least one, but 4-5 are recommended for resilience.
+    ```
+    GEMINI_API_KEY_1="YOUR_API_KEY_HERE"
+    GEMINI_API_KEY_2="YOUR_API_KEY_HERE"
+    GEMINI_API_KEY_3="YOUR_API_KEY_HERE"
+    GEMINI_API_KEY_4="YOUR_API_KEY_HERE"
+    ```
+
+### 4.3. Install Dependencies
+
+* With a clean folder and configured `.env` file, open your terminal in the project directory and run the standard installation command.
+
+    ```bash
+    npm install
+    ```
+    *Note: If you encounter `ERESOLVE` errors, it indicates a deep dependency conflict. The `package.json` in this repository should contain a stable set of versions. If issues persist, running `npm install --force` can override these conflicts.*
+
+### 4.4. Running the Agent
+
+The agent requires **two** separate terminal windows to run.
+
+1.  **Terminal 1: Start the Database**
+    * Open a new terminal window.
+    * Run the following command to download and start the ChromaDB server.
+        ```bash
+        docker run -p 8000:8000 chromadb/chroma
+        ```
+    * You must **leave this terminal window open**. This is the agent's memory.
+
+2.  **Terminal 2: Start the Agent**
+    * Open a second terminal window in your project folder.
+    * Run the following command to start the main application.
+        ```bash
+        node index.js
+        ```
+    * You should see the message: `🚀 Server is ready and listening on http://localhost:3000`.
+
+3.  **Access the UI**:
+    * Open your web browser and navigate to `http://localhost:3000`.
+    * You can now interact with the agent.
 
 ---
 
-## File-by-File Deep Dive
+## 5. Developer's Guide
 
-### index.js — Core Server & Agent Logic
-- **Dependencies**: dotenv, fs, http, express, ws, puppeteer-extra (+stealth), @google/generative-ai, @langchain/langgraph.
-- **LangGraph State**: Tracks objective, credentials, history, summary, lastActionFailed, nextPage, needsKeyRotation, etc.
-- **Nodes**:
-  - `callOrchestrator`: Fills the orchestrator prompt, gets a plan from Gemini, handles JSON parsing, and error recovery.
-  - `callSpecialist`: Sends screenshot/HTML to Gemini, gets a precise action, retries with HTML if needed.
-  - `updateContextNode`: Parses credentials/URLs from the objective and updates state.
-  - `executeActionNode`: Runs the planned action in Puppeteer, updates summary/history, and handles errors.
-  - `humanInputNode`: Requests input from the frontend/user.
-  - `rotateKeyNode`: Rotates Gemini API keys on rate limit errors.
-- **Graph Edges**: Conditional routing between nodes based on tool, errors, or completion.
-- **API Key Management**: Reads/writes `key_state.json` to persist key rotation state.
-- **Prompts**: Loads `prompt-orchestrator.txt` and `prompt.txt` for AI planning/action.
-- **Server**: Express serves static files; WebSocket handles real-time communication.
-- **Browser Profile**: Uses `my_browser_profile/` for persistent sessions.
+This section provides essential information for debugging, maintaining, and extending the agent.
 
-### prompt-orchestrator.txt — Orchestrator Prompt
-- **Mission**: High-level planner; decomposes objectives into logical steps.
-- **Principles**: Sequential decomposition, constant re-evaluation, intelligent navigation, human-in-the-loop, anti-looping, strict completion.
-- **Tool Schema**: JSON output specifying next tool (`analyze_screen`, `Google Search`, `goto`, `request_human_input`, `finished`), with reasoning and required fields.
-- **Directives**: Always request human input if blocked, never guess, always output valid JSON, recover from failures, avoid infinite loops.
+### 5.1. Understanding the Console Logs
 
-### prompt.txt — Specialist Prompt
-- **Mission**: Receives a single task and outputs the most robust browser action as JSON.
-- **Rules**: JSON-only output, scope limitation, vision-first, mandatory HTML request if needed, forensic self-correction, no hallucination, strict CSS selector hierarchy, standard CSS only.
-- **Action Schema**: JSON with reasoning, action (`type`, `click`, `scroll`, `error`), selector, text, and summary.
+The console output is verbose by design. Understanding the emoji prefixes is key to debugging:
+* `🚀, ✅`: Server status and successful connections.
+* `🔑`: API key rotation events.
+* `🧠`: The agent is "thinking." This prefix appears for memory searches and Orchestrator planning.
+* `💡`: The Specialist has decided on a specific action.
+* `⚡`: The agent is executing a browser action.
+* `❌, 🛑`: An error has occurred or a rate limit has been hit.
 
-### client.js — Frontend Logic
-- **WebSocket**: Connects to backend, handles messages (`greeting`, `status`, `request_input`, `final_answer`).
-- **UI Updates**: Adds messages to chat log, displays status, enables/disables input as needed.
-- **Input Handling**: Sends user input to backend, disables input while agent is working.
-- **Screenshot Support**: (Commented out) Can display screenshots from backend.
+### 5.2. Debugging a Failed Task: A Step-by-Step Process
 
-### index.html — Frontend UI
-- **Structure**: Minimal chat interface with message log and input form.
-- **Script**: Loads `client.js` for frontend logic.
-- **Styling**: Linked to `style.css`.
+1.  **Identify the Point of Failure**: Look at the last `⚡ Executing` or `💡 Specialist Action` log before the error. What was the agent trying to do?
+2.  **Check the Orchestrator's Reasoning**: Read the `🗺️ Orchestrator Plan` that led to the failure. Did its reasoning make sense based on the previous step's summary?
+3.  **Analyze the Specialist's Decision**: If the failure was at the Specialist level, read its `reasoning`. Why did it choose that specific action or selector? Why did it return an `error`?
+4.  **Examine the Raw AI Output**: If the application crashes due to a JSON parsing error, the logs will show `--- RAW ORCHESTRATOR OUTPUT ---`. This is the most critical piece of debugging information. It shows you exactly what the AI sent back, often revealing malformed JSON or unexpected text.
+5.  **Look at the Browser**: The Puppeteer window is visible (`headless: false`). Observe the agent's actions in real-time. Does the visual state of the page match what the agent *thinks* it's seeing? This is the best way to spot discrepancies (e.g., the agent thinks it's on a search results page, but it's actually on a CAPTCHA page).
 
-### style.css — Styling
-- **Modern Chat UI**: Responsive, clean, and visually appealing.
-- **Message Types**: Distinct styles for agent, user, and status messages.
-- **Input Form**: Styled for usability and accessibility.
-- **Screenshot Support**: Styles for displaying screenshots.
+### 5.3. How to Add a New Feature (Example: A `read_pdf` Tool)
 
-### package.json — Dependencies
-- **Key Packages**:
-  - `@google/generative-ai`: Gemini API
-  - `@langchain/langgraph`: LangGraph workflow
-  - `puppeteer`, `puppeteer-extra`, `puppeteer-extra-plugin-stealth`: Browser automation
-  - `express`, `ws`: Server and WebSocket
-  - `dotenv`: Environment variable management
-- **No test script** (placeholder only).
+1.  **Update the Orchestrator's Prompt**:
+    * Open `prompt-orchestrator.txt`.
+    * Add `'read_pdf'` to the list of available tools in the `TOOL SCHEMA` section.
+    * Add a guideline explaining when to use this tool (e.g., "If the page is a PDF document and the objective is to find information within it, use the `read_pdf` tool.").
 
-### NOTES.md — Project Notes
-- **Known Issue**: After completing a task, the script closes the Chrome tab. (May affect session continuity for multi-step objectives.)
+2.  **Implement the Tool's Logic in `index.js`**:
+    * Create a new async function: `async function readPdfNode(state) { ... }`.
+    * Inside this function, add the logic to download the PDF from the current page URL, parse its text content (using a library like `pdf-parse`), and store the extracted text in the `state.summary`.
+
+3.  **Integrate the New Node into the Graph**:
+    * In `index.js`, register the new node: `workflow.addNode("read_pdf", readPdfNode);`.
+    * Update the Orchestrator's conditional routing (`workflow.addConditionalEdges("orchestrator", ...)`). Add a new condition: `if (tool === 'read_pdf') return "read_pdf";`.
+    * Add a new edge to tell the graph where to go *after* the PDF is read: `workflow.addEdge("read_pdf", "orchestrator");`. This sends the extracted text back to the Orchestrator for the next planning step.
 
 ---
 
-## Setup & Usage
+## 6. Strategic Enhancement Pipeline
 
-1. **Install dependencies**:
-   ```sh
-   npm install
-   ```
-2. **Set up environment variables**:
-   - Create a `.env` file with your Gemini API keys:
-     ```env
-     GEMINI_API_KEY_1=your_key_1
-     GEMINI_API_KEY_2=your_key_2
-     GEMINI_API_KEY_3=your_key_3
-     GEMINI_API_KEY_4=your_key_4
-     ```
-3. **Run the server**:
-   ```sh
-   node index.js
-   ```
-4. **Open your browser** to [http://localhost:3000](http://localhost:3000)
-5. **Interact via the chat UI**: Type your objective and follow prompts.
+This is the official roadmap for future development, prioritized by impact.
+
+* **Phase 1: Foundational Efficiency**:
+    1.  **HTML Content Summarization & Targeted Extraction**: Pre-process HTML using a fast model to extract only interactive elements and their key attributes, dramatically reducing token usage and improving selector stability.
+    2.  **Action Sequence Specialist**: Specialist now produces multi-step plans for complex tasks, or single actions for simple ones, in a single API call.
+    3.  **AI-Powered History Summarization**: Planned upgrade to use an AI model for more narrative, compact summaries of action history.
+
+* **Phase 2: Advanced Reasoning & Resilience**:
+    4.  **Dynamic Model Selection**: Planned triage node to route tasks to the most cost-effective AI model.
+    5.  **Advanced Error Classification & Correction**: Planned upgrade for error type classification and targeted recovery strategies.
+    6.  **Goal-Oriented Memory (RAG V2)**: Planned upgrade to store and recall chains of sub-goals for complex, multi-stage objectives.
+
+* **Phase 3: State-of-the-Art Capabilities**:
+    7.  **Multi-Tab/Window Management**: Planned support for multiple browser tabs.
+    8.  **Visual Grounding & Ambiguity Resolution**: Planned upgrade for human-in-the-loop ambiguity resolution with screenshots and element highlighting.
+    9.  **Cross-Application Capabilities**: Planned extension to control desktop applications beyond the browser.
 
 ---
 
-## API Key Management
-- **Multiple Keys**: Supports up to 4 Gemini API keys for rate limit resilience.
-- **Rotation**: On 429 errors, rotates to the next key and persists state in `key_state.json`.
-- **Add/Remove Keys**: Edit your `.env` file and restart the server.
+## 7. Contributing
 
----
+Contributions are welcome. Please open an issue to discuss proposed changes or submit a pull request with a clear description of the enhancement.
 
-## Security & Best Practices
-- **Never share your API keys** or commit `.env` to version control.
-- **Human-in-the-loop**: Agent will always ask for sensitive info (credentials, OTPs) rather than guessing.
-- **Error Recovery**: Agent will not loop endlessly; it will try alternative strategies or request human help.
-- **Session Isolation**: Each user session uses a separate browser profile for privacy.
+## 8. License
 
----
+This project is licensed under the MIT License.
 
-## Troubleshooting
-- **Browser closes after task**: This is a known issue (see `NOTES.md`). For multi-step workflows, consider modifying the cleanup logic.
-- **API Rate Limits**: Ensure you have multiple valid Gemini API keys in your `.env`.
-- **WebSocket Connection Issues**: Make sure the server is running and accessible at `ws://localhost:3000`.
-- **Puppeteer Errors**: Ensure Chrome is installed and accessible, or use Puppeteer's bundled Chromium.
+## 9. Contact
 
----
-
-## License
-This project is licensed under the ISC License. See `package.json` for details.
+Developed by Saqib Sherwani.
+* [GitHub](https://github.com/saqibcodes007)
+* [Email](mailto:sherwanisaqib@gmail.com)
