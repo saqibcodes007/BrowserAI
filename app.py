@@ -56,25 +56,30 @@ def initialize_browser_session():
         return False
 
 def create_fresh_browser_session():
-    """Only used as fallback if main session fails - try to recover"""
+    """Create a completely fresh browser session"""
     try:
         global browser_session
         if browser_session:
             try:
-                # Use asyncio to properly close the session
+                # Force close the existing session completely
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
-                loop.run_until_complete(browser_session.close())
+                # Kill it completely to avoid any session ID conflicts
+                if hasattr(browser_session, 'kill'):
+                    loop.run_until_complete(browser_session.kill())
+                else:
+                    loop.run_until_complete(browser_session.close())
                 loop.close()
-            except:
-                pass
+                logger.info("🔄 Old browser session closed")
+            except Exception as close_error:
+                logger.warning(f"⚠️ Error closing old session: {close_error}")
         
-        # Create new session with keep_alive=True to persist across interactions
+        # Create completely new session with keep_alive=True
         browser_session = BrowserSession(keep_alive=True)
-        logger.info("✅ Recovery browser session created")
+        logger.info("✅ Fresh browser session created")
         return True
     except Exception as e:
-        logger.error(f"❌ Failed to create recovery browser session: {e}")
+        logger.error(f"❌ Failed to create fresh browser session: {e}")
         return False
 
 @app.route('/')
@@ -165,11 +170,42 @@ def handle_browser_automation():
                 
         except Exception as e:
             logger.error(f"❌ Error running agent: {e}")
-            # If browser session is corrupted, try to recover
-            if 'BrowserContext' in str(e) or 'NoneType' in str(e):
-                logger.warning("🔄 Browser session appears corrupted, attempting recovery")
+            # If browser session is corrupted, always try to recover with a completely fresh session
+            if 'BrowserContext' in str(e) or 'NoneType' in str(e) or 'send' in str(e):
+                logger.warning("🔄 Browser session corrupted - creating completely fresh session")
+                
+                # Force create a completely fresh browser session
                 if create_fresh_browser_session():
-                    return jsonify({'response': 'Browser session was recovered. Please try your request again.'})
+                    logger.info("🔄 Attempting task with fresh browser session")
+                    # Try running the agent again with completely fresh session
+                    try:
+                        fresh_agent = Agent(
+                            task=full_task_with_history,
+                            llm=llm,
+                            browser_session=browser_session,
+                            interactive=True,
+                        )
+                        
+                        fresh_run_history = loop.run_until_complete(fresh_agent.run())
+                        
+                        if fresh_run_history.history and len(fresh_run_history.history) > 0:
+                            last_event = fresh_run_history.history[-1]
+                            if hasattr(last_event, 'result') and last_event.result:
+                                result_info = last_event.result[0]
+                                agent_response = result_info.extracted_content
+                                logger.info(f"✅ Fresh session agent response: {agent_response}")
+                                return jsonify({'response': agent_response})
+                            else:
+                                logger.warning("⚠️ No result in fresh session run")
+                                return jsonify({'response': 'Browser session was recovered, but I could not extract specific results. Please try again.'})
+                        else:
+                            logger.warning("⚠️ No history in fresh session run")
+                            return jsonify({'response': 'Browser session was recovered. Please try your request again.'})
+                    except Exception as recovery_error:
+                        logger.error(f"❌ Fresh session recovery failed: {recovery_error}")
+                        return jsonify({'response': 'Browser session recovery failed. Please try your request again.'})
+                else:
+                    return jsonify({'response': 'Could not create fresh browser session. Please try again.'})
             
             return jsonify({'response': f'I encountered an error: {str(e)}. Please try again.'})
         finally:
