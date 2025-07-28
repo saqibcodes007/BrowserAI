@@ -21,6 +21,7 @@ app.secret_key = os.environ.get("SESSION_SECRET", "potentia-ai-secret-key")
 conversation_history = []
 llm = None
 browser_session = None
+current_agent = None  # Keep track of current agent instance
 
 def initialize_browser_session():
     """Initialize the browser session and LLM"""
@@ -69,8 +70,8 @@ def create_fresh_browser_session():
             except:
                 pass
         
-        # Create new session - don't keep alive to prevent session corruption issues
-        browser_session = BrowserSession(keep_alive=False)
+        # Create new session with keep_alive=True to persist across interactions
+        browser_session = BrowserSession(keep_alive=True)
         logger.info("✅ Fresh browser session created")
         return True
     except Exception as e:
@@ -115,14 +116,25 @@ def agent_endpoint():
 
 def handle_browser_automation():
     """Handle requests with full browser automation"""
-    global conversation_history, llm, browser_session
+    global conversation_history, llm, browser_session, current_agent
     
     try:
-        # Always create a fresh browser session to prevent corruption
-        # This matches the original main copy.py behavior
-        if not create_fresh_browser_session():
-            logger.warning("⚠️ Could not create browser session")
-            return jsonify({'response': 'Browser automation is not available. Please ensure Chrome or Firefox is installed and try again.'}), 200
+        # Check if we have an ongoing session that we should continue
+        latest_user_msg = conversation_history[-1] if conversation_history else ""
+        
+        # If this looks like a response to an agent request (credentials, etc.), 
+        # we need to continue the existing session, not create a new one
+        is_continuing_session = (
+            browser_session is not None and 
+            current_agent is not None and
+            any(word in latest_user_msg.lower() for word in ['username:', 'password:', 'email:', '@'])
+        )
+        
+        if not is_continuing_session:
+            # Create fresh session for new tasks
+            if not create_fresh_browser_session():
+                logger.warning("⚠️ Could not create browser session")
+                return jsonify({'response': 'Browser automation is not available. Please ensure Chrome or Firefox is installed and try again.'}), 200
         
         # Format the conversation history exactly like the original main copy.py
         full_task_with_history = "\n".join(conversation_history)
@@ -132,15 +144,30 @@ def handle_browser_automation():
         asyncio.set_event_loop(loop)
         
         try:
-            # Create agent exactly like the original - no special prompts or modifications
-            agent = Agent(
-                task=full_task_with_history,
-                llm=llm,
-                browser_session=browser_session,
-                interactive=True,
-            )
+            if is_continuing_session and current_agent:
+                # Continue with existing agent - this is the key insight from your original code
+                logger.info(f"🔄 Continuing existing agent session with new input: {latest_user_msg}")
+                
+                # The agent should already be on the correct page, just provide the new information
+                # We'll create a new agent but with the persistent browser session
+                agent = Agent(
+                    task=f"Continue the previous task. The user has now provided: {latest_user_msg}",
+                    llm=llm,
+                    browser_session=browser_session,
+                    interactive=True,
+                )
+                current_agent = agent
+            else:
+                # Create new agent for new tasks
+                agent = Agent(
+                    task=full_task_with_history,
+                    llm=llm,
+                    browser_session=browser_session,
+                    interactive=True,
+                )
+                current_agent = agent
             
-            logger.info(f"🚀 Agent running with context: {full_task_with_history}")
+            logger.info(f"🚀 Agent running")
             
             # Run the agent
             run_history = loop.run_until_complete(agent.run())
@@ -154,6 +181,16 @@ def handle_browser_automation():
                     agent_response = result_info.extracted_content
                     
                     logger.info(f"✅ Agent response: {agent_response}")
+                    
+                    # Check if the agent is asking for input - if so, keep session alive
+                    asking_for_input = any(word in agent_response.lower() for word in ['provide', 'enter', 'username', 'password', 'credentials'])
+                    if asking_for_input:
+                        logger.info("🔒 Keeping browser session alive for user input")
+                        # Don't reset current_agent or browser_session
+                    else:
+                        # Task appears complete, can reset for next task
+                        current_agent = None
+                    
                     return jsonify({'response': agent_response})
                 else:
                     logger.warning("⚠️ No result found in agent response")
@@ -164,13 +201,16 @@ def handle_browser_automation():
                 
         except Exception as e:
             logger.error(f"❌ Error running agent: {e}")
+            # Reset agent on error
+            current_agent = None
             return jsonify({'response': f'I encountered an error: {str(e)}. Please try again.'})
         finally:
-            # Clean up
+            # Clean up loop but keep browser session if agent is waiting for input
             loop.close()
             
     except Exception as e:
         logger.error(f"❌ Error in browser automation: {e}")
+        current_agent = None
         return jsonify({'response': f'I encountered an error: {str(e)}. Please try again.'})
 
 def handle_llm_only_response():
