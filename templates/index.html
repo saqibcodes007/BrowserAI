@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Potentia AI</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+</head>
+<body>
+    <div id="app-container">
+        <header class="app-header">
+            <div class="title-container">
+                <h1 class="title-text">Potentia AI</h1>
+                <p class="subtitle">Autonomous Web Agent</p>
+            </div>
+        </header>
+        <div id="chat-window">
+        </div>
+        <div id="input-area">
+            <textarea id="user-input" placeholder="Enter your task or query here..." rows="1"></textarea>
+            <button id="send-btn">
+                <i class="fas fa-arrow-right"></i>
+            </button>
+        </div>
+        <footer>
+            <div class="footer-container">
+                <p>Developed by Saqib Sherwani</p>
+                <p>Copyright © 2025 • All Rights Reserved</p>
+            </div>
+        </footer>
+    </div>
+    <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
